@@ -1,7 +1,7 @@
 # weekly_report.py
-# Sends a sharp HTML weekly market recap email using Gmail SMTP
-# Pulls SPY weekly pricing and Silver XAG/USD weekly pricing from Alpha Vantage
-# Pulls headlines from NewsAPI
+# Sharp HTML weekly market recap email using Gmail SMTP
+# SPY weekly pricing and Silver XAG/USD weekly pricing from Alpha Vantage
+# Headlines from NewsAPI
 # Designed to always attempt sending an email, even if APIs fail
 
 from __future__ import annotations
@@ -20,31 +20,12 @@ from email.mime.text import MIMEText
 from email.utils import formataddr, make_msgid
 from typing import Any
 
+import smtplib
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-
-
-# ========= Secrets expected as environment variables =========
-# Gmail SMTP
-#   GMAIL_USERNAME
-#   GMAIL_APP_PASSWORD
-#   EMAIL_TO
-# Optional
-#   EMAIL_CC
-#   EMAIL_BCC
-#   EMAIL_FROM_NAME
-#   SMTP_HOST
-#   SMTP_PORT
-#
-# Alpha Vantage
-#   ALPHAVANTAGE_API_KEY
-#
-# NewsAPI
-#   NEWSAPI_API_KEY
 
 
 class ConfigError(Exception):
@@ -219,13 +200,11 @@ def send_email(cfg: EmailConfig, subject: str, text_body: str, html_body: str | 
             return
 
         except smtplib.SMTPAuthenticationError as e:
-            raise EmailSendError(
-                "Authentication failed. Verify GMAIL_USERNAME and use the Gmail App Password."
-            ) from e
+            raise EmailSendError("Authentication failed. Verify Gmail username and App Password.") from e
 
         except (smtplib.SMTPConnectError, smtplib.SMTPServerDisconnected, socket.timeout, ConnectionError, OSError) as e:
             last_err = e
-            backoff = min(90, 2**attempt)
+            backoff = min(90, 2 ** attempt)
             logging.warning(f"Transient SMTP error {type(e).__name__}. Retrying in {backoff} seconds.")
             time.sleep(backoff)
 
@@ -250,16 +229,9 @@ def make_session() -> requests.Session:
     adapter = HTTPAdapter(max_retries=retries, pool_connections=10, pool_maxsize=10)
     s.mount("https://", adapter)
     s.mount("http://", adapter)
-    s.headers.update(
-        {
-            "User-Agent": "weekly-market-report/1.0",
-            "Accept": "application/json",
-        }
-    )
+    s.headers.update({"User-Agent": "weekly-market-report/1.0", "Accept": "application/json"})
     return s
 
-
-# ========= Alpha Vantage pricing =========
 
 ALPHAVANTAGE_BASE_URL = "https://www.alphavantage.co/query"
 
@@ -290,12 +262,7 @@ def av_get_json(session: requests.Session, params: dict[str, Any]) -> dict[str, 
 def av_weekly_fx_close(session: requests.Session, api_key: str, from_symbol: str, to_symbol: str) -> tuple[float, float]:
     data = av_get_json(
         session,
-        {
-            "function": "FX_WEEKLY",
-            "from_symbol": from_symbol,
-            "to_symbol": to_symbol,
-            "apikey": api_key,
-        },
+        {"function": "FX_WEEKLY", "from_symbol": from_symbol, "to_symbol": to_symbol, "apikey": api_key},
     )
 
     ts = data.get("Time Series FX (Weekly)")
@@ -306,11 +273,8 @@ def av_weekly_fx_close(session: requests.Session, api_key: str, from_symbol: str
     if len(dates) < 2:
         raise DataFetchError("Not enough weekly FX points to compute weekly change")
 
-    latest = ts[dates[0]]
-    prev = ts[dates[1]]
-
-    latest_close = float(latest["4. close"])
-    prev_close = float(prev["4. close"])
+    latest_close = float(ts[dates[0]]["4. close"])
+    prev_close = float(ts[dates[1]]["4. close"])
     if prev_close == 0:
         raise DataFetchError("Previous close was 0, cannot compute percent change")
 
@@ -321,11 +285,7 @@ def av_weekly_fx_close(session: requests.Session, api_key: str, from_symbol: str
 def av_weekly_equity_close(session: requests.Session, api_key: str, symbol: str) -> tuple[float, float]:
     data = av_get_json(
         session,
-        {
-            "function": "TIME_SERIES_WEEKLY_ADJUSTED",
-            "symbol": symbol,
-            "apikey": api_key,
-        },
+        {"function": "TIME_SERIES_WEEKLY_ADJUSTED", "symbol": symbol, "apikey": api_key},
     )
 
     ts = data.get("Weekly Adjusted Time Series")
@@ -347,8 +307,6 @@ def av_weekly_equity_close(session: requests.Session, api_key: str, symbol: str)
     week_change_pct = (latest_close / prev_close - 1.0) * 100.0
     return latest_close, week_change_pct
 
-
-# ========= NewsAPI =========
 
 NEWSAPI_BASE_URL = "https://newsapi.org/v2/everything"
 
@@ -393,16 +351,11 @@ def newsapi_get(session: requests.Session, api_key: str, query: str, page_size: 
     return out
 
 
-# ========= Email rendering =========
-
 def html_wrapper(title: str, subtitle: str, body_html: str) -> str:
     return f"""
 <html>
   <body style="margin:0; padding:0; background:#f5f7fb;">
-    <div style="display:none; max-height:0px; overflow:hidden; opacity:0;">
-      Weekly Market Recap
-    </div>
-
+    <div style="display:none; max-height:0px; overflow:hidden; opacity:0;">Weekly Market Recap</div>
     <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="background:#f5f7fb; padding:24px 0;">
       <tr>
         <td align="center">
@@ -418,11 +371,7 @@ def html_wrapper(title: str, subtitle: str, body_html: str) -> str:
                       {escape_html(subtitle)}
                     </div>
                   </div>
-
-                  <div style="padding:18px 20px;">
-                    {body_html}
-                  </div>
-
+                  <div style="padding:18px 20px;">{body_html}</div>
                   <div style="padding:14px 20px; border-top:1px solid #e8edf6; background:#fbfcff;">
                     <div style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial,sans-serif; font-size:12px; color:#64748b;">
                       Sent automatically via GitHub Actions.
@@ -587,22 +536,18 @@ def build_report(prices: dict[str, dict[str, Any]], news: list[dict[str, Any]], 
     return subject, text_body, html_body
 
 
-# ========= Data fetch, fully wired to your secrets =========
-
 def fetch_prices(session: requests.Session) -> dict[str, dict[str, Any]]:
-    prices: dict[str, dict[str, Any]] = {}
-
     av_key = (env_str("ALPHAVANTAGE_API_KEY") or "").strip()
     if not av_key:
         raise DataFetchError("Missing ALPHAVANTAGE_API_KEY")
 
     spy_latest, spy_week = av_weekly_equity_close(session, av_key, "SPY")
-    prices["SPY"] = {"latest": spy_latest, "week_change_pct": spy_week}
-
     silver_latest, silver_week = av_weekly_fx_close(session, av_key, "XAG", "USD")
-    prices["Silver (XAG/USD)"] = {"latest": silver_latest, "week_change_pct": silver_week}
 
-    return prices
+    return {
+        "SPY": {"latest": spy_latest, "week_change_pct": spy_week},
+        "Silver (XAG/USD)": {"latest": silver_latest, "week_change_pct": silver_week},
+    }
 
 
 def fetch_news(session: requests.Session) -> list[dict[str, Any]]:
@@ -611,8 +556,6 @@ def fetch_news(session: requests.Session) -> list[dict[str, Any]]:
         raise DataFetchError("Missing NEWSAPI_API_KEY")
 
     out: list[dict[str, Any]] = []
-
-    # Hyper practical queries that tend to return relevant headlines
     queries = [
         ("SPY", "SPY OR S&P 500 ETF OR SPDR S&P 500"),
         ("Silver (XAG/USD)", "silver price OR XAGUSD OR XAG/USD"),
@@ -631,11 +574,7 @@ def fetch_news(session: requests.Session) -> list[dict[str, Any]]:
                 }
             )
 
-    # Sort newest first if publishedAt is present
-    def sort_key(item: dict[str, Any]) -> str:
-        return str(item.get("publishedAt") or "")
-
-    out.sort(key=sort_key, reverse=True)
+    out.sort(key=lambda x: str(x.get("publishedAt") or ""), reverse=True)
     return out[:12]
 
 

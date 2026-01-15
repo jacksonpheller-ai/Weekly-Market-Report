@@ -1,22 +1,50 @@
+# weekly_report.py
+# Sends a sharp HTML weekly market recap email using Gmail SMTP
+# Pulls SPY weekly pricing and Silver XAG/USD weekly pricing from Alpha Vantage
+# Pulls headlines from NewsAPI
+# Designed to always attempt sending an email, even if APIs fail
+
+from __future__ import annotations
+
+import json
+import logging
 import os
+import socket
 import ssl
 import time
-import json
-import socket
-import smtplib
-import logging
 import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from email.utils import formataddr, make_msgid
-from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.utils import formataddr, make_msgid
+from typing import Any
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+
+# ========= Secrets expected as environment variables =========
+# Gmail SMTP
+#   GMAIL_USERNAME
+#   GMAIL_APP_PASSWORD
+#   EMAIL_TO
+# Optional
+#   EMAIL_CC
+#   EMAIL_BCC
+#   EMAIL_FROM_NAME
+#   SMTP_HOST
+#   SMTP_PORT
+#
+# Alpha Vantage
+#   ALPHAVANTAGE_API_KEY
+#
+# NewsAPI
+#   NEWSAPI_API_KEY
 
 
 class ConfigError(Exception):
@@ -24,6 +52,10 @@ class ConfigError(Exception):
 
 
 class EmailSendError(Exception):
+    pass
+
+
+class DataFetchError(Exception):
     pass
 
 
@@ -41,12 +73,66 @@ def parse_email_list(value: str | None) -> list[str]:
     return [p for p in parts if p]
 
 
-def safe_truncate(text: str, limit: int = 8000) -> str:
+def safe_truncate(text: str, limit: int = 14000) -> str:
     if text is None:
         return ""
     if len(text) <= limit:
         return text
     return text[:limit] + "\n\n[truncated]"
+
+
+def escape_html(text: Any) -> str:
+    if text is None:
+        return ""
+    s = str(text)
+    return (
+        s.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#39;")
+    )
+
+
+def as_float(x: Any) -> float | None:
+    try:
+        if x is None:
+            return None
+        if isinstance(x, (int, float)):
+            return float(x)
+        s = str(x).strip()
+        if s.endswith("%"):
+            s = s[:-1].strip()
+        return float(s)
+    except Exception:
+        return None
+
+
+def fmt_money(x: Any) -> str:
+    f = as_float(x)
+    if f is None:
+        return "NA"
+    if abs(f) >= 1000:
+        return f"{f:,.2f}"
+    return f"{f:.2f}"
+
+
+def fmt_pct(x: Any) -> str:
+    f = as_float(x)
+    if f is None:
+        return "NA"
+    return f"{f:.2f}%"
+
+
+def badge_style(week_change_pct: Any) -> tuple[str, str]:
+    f = as_float(week_change_pct)
+    if f is None:
+        return "badge neutral", ""
+    if f > 0:
+        return "badge up", "▲"
+    if f < 0:
+        return "badge down", "▼"
+    return "badge neutral", ""
 
 
 @dataclass
@@ -93,13 +179,7 @@ def load_email_config() -> EmailConfig:
     )
 
 
-def send_email(
-    cfg: EmailConfig,
-    subject: str,
-    text_body: str,
-    html_body: str | None,
-    max_retries: int = 5,
-) -> None:
+def send_email(cfg: EmailConfig, subject: str, text_body: str, html_body: str | None) -> None:
     all_recipients = cfg.to_list + cfg.cc_list + cfg.bcc_list
 
     msg = MIMEMultipart("alternative")
@@ -108,15 +188,15 @@ def send_email(
     msg["To"] = ", ".join(cfg.to_list)
     if cfg.cc_list:
         msg["Cc"] = ", ".join(cfg.cc_list)
-
     msg["Message-ID"] = make_msgid()
-    msg.attach(MIMEText(text_body or "", "plain", "utf-8"))
 
+    msg.attach(MIMEText(text_body or "", "plain", "utf-8"))
     if html_body:
         msg.attach(MIMEText(html_body, "html", "utf-8"))
 
     context = ssl.create_default_context()
     timeout_seconds = 30
+    max_retries = 6
     last_err: Exception | None = None
 
     for attempt in range(1, max_retries + 1):
@@ -140,12 +220,12 @@ def send_email(
 
         except smtplib.SMTPAuthenticationError as e:
             raise EmailSendError(
-                "Authentication failed. Verify GMAIL_USERNAME and use the Gmail App Password, not your normal password."
+                "Authentication failed. Verify GMAIL_USERNAME and use the Gmail App Password."
             ) from e
 
         except (smtplib.SMTPConnectError, smtplib.SMTPServerDisconnected, socket.timeout, ConnectionError, OSError) as e:
             last_err = e
-            backoff = min(60, 2 ** attempt)
+            backoff = min(90, 2**attempt)
             logging.warning(f"Transient SMTP error {type(e).__name__}. Retrying in {backoff} seconds.")
             time.sleep(backoff)
 
@@ -155,152 +235,426 @@ def send_email(
     raise EmailSendError(f"Failed to send after {max_retries} attempts. Last error: {repr(last_err)}")
 
 
-def html_wrapper(title: str, inner: str) -> str:
+def make_session() -> requests.Session:
+    s = requests.Session()
+    retries = Retry(
+        total=5,
+        connect=5,
+        read=5,
+        status=5,
+        backoff_factor=0.8,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET",),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retries, pool_connections=10, pool_maxsize=10)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    s.headers.update(
+        {
+            "User-Agent": "weekly-market-report/1.0",
+            "Accept": "application/json",
+        }
+    )
+    return s
+
+
+# ========= Alpha Vantage pricing =========
+
+ALPHAVANTAGE_BASE_URL = "https://www.alphavantage.co/query"
+
+
+def av_get_json(session: requests.Session, params: dict[str, Any]) -> dict[str, Any]:
+    try:
+        r = session.get(ALPHAVANTAGE_BASE_URL, params=params, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        raise DataFetchError(f"Alpha Vantage request failed: {repr(e)}") from e
+
+    if not isinstance(data, dict):
+        raise DataFetchError("Alpha Vantage returned non JSON response")
+
+    if "Error Message" in data:
+        raise DataFetchError(f"Alpha Vantage error: {data.get('Error Message')}")
+
+    if "Note" in data:
+        raise DataFetchError(f"Alpha Vantage rate limit: {data.get('Note')}")
+
+    if "Information" in data and not any(k.startswith("Time Series") for k in data.keys()):
+        raise DataFetchError(f"Alpha Vantage info: {data.get('Information')}")
+
+    return data
+
+
+def av_weekly_fx_close(session: requests.Session, api_key: str, from_symbol: str, to_symbol: str) -> tuple[float, float]:
+    data = av_get_json(
+        session,
+        {
+            "function": "FX_WEEKLY",
+            "from_symbol": from_symbol,
+            "to_symbol": to_symbol,
+            "apikey": api_key,
+        },
+    )
+
+    ts = data.get("Time Series FX (Weekly)")
+    if not isinstance(ts, dict) or not ts:
+        raise DataFetchError("Alpha Vantage did not return weekly FX time series")
+
+    dates = sorted(ts.keys(), reverse=True)
+    if len(dates) < 2:
+        raise DataFetchError("Not enough weekly FX points to compute weekly change")
+
+    latest = ts[dates[0]]
+    prev = ts[dates[1]]
+
+    latest_close = float(latest["4. close"])
+    prev_close = float(prev["4. close"])
+    if prev_close == 0:
+        raise DataFetchError("Previous close was 0, cannot compute percent change")
+
+    week_change_pct = (latest_close / prev_close - 1.0) * 100.0
+    return latest_close, week_change_pct
+
+
+def av_weekly_equity_close(session: requests.Session, api_key: str, symbol: str) -> tuple[float, float]:
+    data = av_get_json(
+        session,
+        {
+            "function": "TIME_SERIES_WEEKLY_ADJUSTED",
+            "symbol": symbol,
+            "apikey": api_key,
+        },
+    )
+
+    ts = data.get("Weekly Adjusted Time Series")
+    if not isinstance(ts, dict) or not ts:
+        raise DataFetchError("Alpha Vantage did not return weekly equity time series")
+
+    dates = sorted(ts.keys(), reverse=True)
+    if len(dates) < 2:
+        raise DataFetchError("Not enough weekly equity points to compute weekly change")
+
+    latest = ts[dates[0]]
+    prev = ts[dates[1]]
+
+    latest_close = float(latest.get("5. adjusted close") or latest["4. close"])
+    prev_close = float(prev.get("5. adjusted close") or prev["4. close"])
+    if prev_close == 0:
+        raise DataFetchError("Previous close was 0, cannot compute percent change")
+
+    week_change_pct = (latest_close / prev_close - 1.0) * 100.0
+    return latest_close, week_change_pct
+
+
+# ========= NewsAPI =========
+
+NEWSAPI_BASE_URL = "https://newsapi.org/v2/everything"
+
+
+def newsapi_get(session: requests.Session, api_key: str, query: str, page_size: int = 5) -> list[dict[str, Any]]:
+    params = {
+        "q": query,
+        "language": "en",
+        "sortBy": "publishedAt",
+        "pageSize": page_size,
+        "apiKey": api_key,
+    }
+    try:
+        r = session.get(NEWSAPI_BASE_URL, params=params, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        raise DataFetchError(f"NewsAPI request failed: {repr(e)}") from e
+
+    if not isinstance(data, dict):
+        raise DataFetchError("NewsAPI returned non JSON response")
+
+    if data.get("status") != "ok":
+        raise DataFetchError(f"NewsAPI error: {data.get('message') or 'unknown'}")
+
+    articles = data.get("articles") or []
+    if not isinstance(articles, list):
+        return []
+
+    out: list[dict[str, Any]] = []
+    for a in articles:
+        if not isinstance(a, dict):
+            continue
+        out.append(
+            {
+                "title": a.get("title") or "",
+                "source": (a.get("source") or {}).get("name") if isinstance(a.get("source"), dict) else "",
+                "url": a.get("url") or "",
+                "publishedAt": a.get("publishedAt") or "",
+            }
+        )
+    return out
+
+
+# ========= Email rendering =========
+
+def html_wrapper(title: str, subtitle: str, body_html: str) -> str:
     return f"""
 <html>
-  <body style="font-family: Arial, sans-serif; line-height: 1.45; background: #ffffff;">
-    <div style="max-width: 900px; margin: 0 auto; padding: 18px;">
-      <h2 style="margin: 0 0 12px 0;">{title}</h2>
-      {inner}
-      <hr style="margin-top: 18px; border: none; border-top: 1px solid #e6e6e6;" />
-      <p style="color: #666; font-size: 12px; margin: 10px 0 0 0;">
-        Sent automatically via GitHub Actions.
-      </p>
+  <body style="margin:0; padding:0; background:#f5f7fb;">
+    <div style="display:none; max-height:0px; overflow:hidden; opacity:0;">
+      Weekly Market Recap
     </div>
+
+    <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="background:#f5f7fb; padding:24px 0;">
+      <tr>
+        <td align="center">
+          <table role="presentation" cellpadding="0" cellspacing="0" width="920" style="max-width:920px; width:100%;">
+            <tr>
+              <td style="padding:0 16px;">
+                <div style="background:#ffffff; border:1px solid #e8edf6; border-radius:16px; overflow:hidden; box-shadow:0 6px 24px rgba(20, 35, 60, 0.06);">
+                  <div style="padding:18px 20px; background:linear-gradient(135deg, #eef6ff 0%, #f4f2ff 100%); border-bottom:1px solid #e8edf6;">
+                    <div style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial,sans-serif; font-size:18px; font-weight:700; color:#0f172a;">
+                      {escape_html(title)}
+                    </div>
+                    <div style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial,sans-serif; font-size:13px; color:#475569; margin-top:6px;">
+                      {escape_html(subtitle)}
+                    </div>
+                  </div>
+
+                  <div style="padding:18px 20px;">
+                    {body_html}
+                  </div>
+
+                  <div style="padding:14px 20px; border-top:1px solid #e8edf6; background:#fbfcff;">
+                    <div style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial,sans-serif; font-size:12px; color:#64748b;">
+                      Sent automatically via GitHub Actions.
+                    </div>
+                  </div>
+                </div>
+              </td>
+            </tr>
+            <tr><td style="height:14px;"></td></tr>
+          </table>
+        </td>
+      </tr>
+    </table>
   </body>
 </html>
 """.strip()
 
 
-def build_report(prices: dict, news: list[dict], errors: list[str]) -> tuple[str, str, str]:
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    subject = f"Weekly Market Recap | {ts}"
-
-    text_lines = []
-    text_lines.append(f"Weekly Market Recap ({ts})")
-    text_lines.append("")
-    text_lines.append("Prices:")
-    text_lines.append(safe_truncate(json.dumps(prices, indent=2, ensure_ascii=False)))
-    text_lines.append("")
-    text_lines.append("News:")
-    text_lines.append(safe_truncate(json.dumps(news[:15], indent=2, ensure_ascii=False)))
-    text_lines.append("")
-    text_lines.append("Errors:")
-    text_lines.append("None" if not errors else safe_truncate("\n\n".join(errors), 12000))
-    text_body = "\n".join(text_lines)
-
-    price_rows = []
+def prices_table(prices: dict[str, dict[str, Any]]) -> str:
+    rows = []
     for asset, v in (prices or {}).items():
-        latest = v.get("latest", "NA")
-        week_change = v.get("week_change_pct", "NA")
-        price_rows.append(
-            "<tr>"
-            f"<td style='padding:8px 10px; border-bottom:1px solid #efefef;'><b>{asset}</b></td>"
-            f"<td style='padding:8px 10px; border-bottom:1px solid #efefef;'>{latest}</td>"
-            f"<td style='padding:8px 10px; border-bottom:1px solid #efefef;'>{week_change}</td>"
-            "</tr>"
-        )
-    if not price_rows:
-        price_table = "<p>No pricing data returned by your API.</p>"
-    else:
-        price_table = (
-            "<table style='border-collapse:collapse; width:100%;'>"
-            "<tr>"
-            "<th style='text-align:left; padding:8px 10px; border-bottom:2px solid #d9d9d9;'>Asset</th>"
-            "<th style='text-align:left; padding:8px 10px; border-bottom:2px solid #d9d9d9;'>Latest</th>"
-            "<th style='text-align:left; padding:8px 10px; border-bottom:2px solid #d9d9d9;'>Weekly Change</th>"
-            "</tr>"
-            + "".join(price_rows)
-            + "</table>"
+        latest = v.get("latest")
+        week_change_pct = v.get("week_change_pct")
+        klass, arrow = badge_style(week_change_pct)
+        rows.append(
+            f"""
+<tr>
+  <td style="padding:12px 12px; border-bottom:1px solid #eef2f8; font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial,sans-serif; color:#0f172a; font-size:14px;">
+    <div style="font-weight:700;">{escape_html(asset)}</div>
+  </td>
+  <td style="padding:12px 12px; border-bottom:1px solid #eef2f8; font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial,sans-serif; color:#0f172a; font-size:14px; text-align:right;">
+    {fmt_money(latest)}
+  </td>
+  <td style="padding:12px 12px; border-bottom:1px solid #eef2f8; font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial,sans-serif; font-size:14px; text-align:right;">
+    <span class="{klass}" style="display:inline-block; padding:6px 10px; border-radius:999px; font-weight:700;">
+      {arrow} {fmt_pct(week_change_pct)}
+    </span>
+  </td>
+</tr>
+""".strip()
         )
 
-    news_items = []
-    for item in (news or [])[:15]:
-        title = item.get("title", "")
-        source = item.get("source", "")
-        asset = item.get("asset", "")
+    if not rows:
+        return "<p style='margin:0; color:#475569; font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial,sans-serif;'>No pricing data returned.</p>"
+
+    return f"""
+<style>
+  .badge {{ border: 1px solid transparent; }}
+  .badge.up {{ background:#eefaf3; color:#116a3a; border-color:#cfeedd; }}
+  .badge.down {{ background:#fff1f2; color:#9f1239; border-color:#fecdd3; }}
+  .badge.neutral {{ background:#f1f5f9; color:#334155; border-color:#e2e8f0; }}
+</style>
+
+<table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="border-collapse:collapse; border:1px solid #e8edf6; border-radius:14px; overflow:hidden;">
+  <tr style="background:#f8fafc;">
+    <th style="text-align:left; padding:12px 12px; font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial,sans-serif; font-size:12px; color:#475569; letter-spacing:0.04em; text-transform:uppercase;">Asset</th>
+    <th style="text-align:right; padding:12px 12px; font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial,sans-serif; font-size:12px; color:#475569; letter-spacing:0.04em; text-transform:uppercase;">Latest</th>
+    <th style="text-align:right; padding:12px 12px; font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial,sans-serif; font-size:12px; color:#475569; letter-spacing:0.04em; text-transform:uppercase;">Weekly Change</th>
+  </tr>
+  {''.join(rows)}
+</table>
+""".strip()
+
+
+def news_cards(news: list[dict[str, Any]]) -> str:
+    items = []
+    for item in (news or [])[:12]:
+        asset = escape_html(item.get("asset", ""))
+        title = escape_html(item.get("title", ""))
+        source = escape_html(item.get("source", ""))
         url = item.get("url", "")
-        if url:
-            news_items.append(
-                "<li style='margin: 6px 0;'>"
-                f"<b>{asset}</b> "
-                f"<a href='{url}' style='text-decoration:none;'>{title}</a> "
-                f"<span style='color:#666;'>({source})</span>"
-                "</li>"
-            )
-        else:
-            news_items.append(
-                "<li style='margin: 6px 0;'>"
-                f"<b>{asset}</b> {title} <span style='color:#666;'>({source})</span>"
-                "</li>"
-            )
-    news_block = "<p>No news items returned by your API.</p>" if not news_items else "<ul style='padding-left: 18px;'>" + "".join(news_items) + "</ul>"
 
-    if errors:
-        errors_html = (
-            "<div style='background:#f7f7f7; padding:12px; border-radius:10px; white-space:pre-wrap;'>"
-            + safe_truncate("\n\n".join(errors), 12000)
-            + "</div>"
+        link_html = f"<a href='{escape_html(url)}' style='color:#0f172a; text-decoration:none;'>{title}</a>" if url else title
+
+        items.append(
+            f"""
+<li style="margin:10px 0; padding:10px 12px; border:1px solid #e8edf6; border-radius:12px; background:#ffffff;">
+  <div style="font-size:12px; color:#64748b; margin-bottom:4px; font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial,sans-serif;">
+    <span style="font-weight:700; color:#0f172a;">{asset}</span>
+    <span style="margin-left:8px;">{source}</span>
+  </div>
+  <div style="font-size:14px; color:#0f172a; font-weight:700; font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial,sans-serif;">
+    {link_html}
+  </div>
+</li>
+""".strip()
         )
-    else:
-        errors_html = "<p>None</p>"
 
-    inner = (
-        "<h3 style='margin: 18px 0 8px 0;'>Prices</h3>"
-        + price_table
-        + "<h3 style='margin: 18px 0 8px 0;'>Top Asset News</h3>"
-        + news_block
-        + "<h3 style='margin: 18px 0 8px 0;'>Errors and Warnings</h3>"
-        + errors_html
+    if not items:
+        return "<p style='margin:0; color:#475569; font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial,sans-serif;'>No headlines returned.</p>"
+
+    return f"<ul style='list-style:none; padding:0; margin:0;'>{''.join(items)}</ul>"
+
+
+def errors_block(errors: list[str]) -> str:
+    if not errors:
+        return "<p style='margin:0; color:#475569; font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial,sans-serif;'>None</p>"
+
+    combined = escape_html(safe_truncate("\n\n".join(errors), 12000))
+    return f"""
+<div style="border:1px solid #ffe4e6; background:#fff1f2; border-radius:14px; padding:12px;">
+  <div style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial,sans-serif; font-weight:700; color:#9f1239; font-size:13px; margin-bottom:8px;">
+    Issues detected
+  </div>
+  <pre style="margin:0; white-space:pre-wrap; font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace; font-size:12px; color:#7f1d1d;">{combined}</pre>
+</div>
+""".strip()
+
+
+def build_report(prices: dict[str, dict[str, Any]], news: list[dict[str, Any]], errors: list[str]) -> tuple[str, str, str]:
+    ts_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    subject = f"Weekly Market Recap | {ts_utc}"
+
+    text_body = "\n".join(
+        [
+            f"Weekly Market Recap ({ts_utc})",
+            "",
+            "Prices:",
+            safe_truncate(json.dumps(prices, indent=2, ensure_ascii=False)),
+            "",
+            "News:",
+            safe_truncate(json.dumps(news[:15], indent=2, ensure_ascii=False)),
+            "",
+            "Errors:",
+            "None" if not errors else safe_truncate("\n\n".join(errors), 12000),
+        ]
     )
 
-    html_body = html_wrapper("Weekly Market Recap", inner)
+    body = f"""
+<div style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial,sans-serif;">
+  <div style="display:flex; gap:12px; flex-wrap:wrap; margin-bottom:16px;">
+    <div style="flex:1; min-width:280px; background:#ffffff; border:1px solid #e8edf6; border-radius:16px; padding:14px;">
+      <div style="font-size:12px; color:#64748b; letter-spacing:0.04em; text-transform:uppercase;">Coverage</div>
+      <div style="margin-top:6px; font-size:14px; color:#0f172a; font-weight:700;">SPY and Silver (XAG/USD)</div>
+      <div style="margin-top:6px; font-size:12px; color:#475569;">Weekly change plus key headlines</div>
+    </div>
+    <div style="flex:1; min-width:280px; background:#ffffff; border:1px solid #e8edf6; border-radius:16px; padding:14px;">
+      <div style="font-size:12px; color:#64748b; letter-spacing:0.04em; text-transform:uppercase;">Reliability</div>
+      <div style="margin-top:6px; font-size:14px; color:#0f172a; font-weight:700;">Email always attempts send</div>
+      <div style="margin-top:6px; font-size:12px; color:#475569;">API errors are included below</div>
+    </div>
+  </div>
+
+  <div style="background:#ffffff; border:1px solid #e8edf6; border-radius:16px; padding:14px; margin-bottom:16px;">
+    <div style="font-size:12px; color:#64748b; letter-spacing:0.04em; text-transform:uppercase; margin-bottom:10px;">Prices</div>
+    {prices_table(prices)}
+  </div>
+
+  <div style="background:#ffffff; border:1px solid #e8edf6; border-radius:16px; padding:14px; margin-bottom:16px;">
+    <div style="font-size:12px; color:#64748b; letter-spacing:0.04em; text-transform:uppercase; margin-bottom:10px;">Top Asset News</div>
+    {news_cards(news)}
+  </div>
+
+  <div style="background:#ffffff; border:1px solid #e8edf6; border-radius:16px; padding:14px;">
+    <div style="font-size:12px; color:#64748b; letter-spacing:0.04em; text-transform:uppercase; margin-bottom:10px;">Errors and Warnings</div>
+    {errors_block(errors)}
+  </div>
+</div>
+""".strip()
+
+    html_body = html_wrapper("Weekly Market Recap", f"Generated {ts_utc}", body)
     return subject, text_body, html_body
 
 
-def fetch_prices_your_api() -> dict:
-    """
-    Replace the body of this function with your real pricing API logic.
+# ========= Data fetch, fully wired to your secrets =========
 
-    Expected output format example:
-    {
-      "SPY": {"latest": 000.00, "week_change_pct": "1.23%"},
-      "Silver Eagle Coins": {"latest": 00.00, "week_change_pct": "0.45%"}
-    }
-    """
-    return {
-        "SPY": {"latest": "NA", "week_change_pct": "NA"},
-        "Silver Eagle Coins": {"latest": "NA", "week_change_pct": "NA"},
-    }
+def fetch_prices(session: requests.Session) -> dict[str, dict[str, Any]]:
+    prices: dict[str, dict[str, Any]] = {}
+
+    av_key = (env_str("ALPHAVANTAGE_API_KEY") or "").strip()
+    if not av_key:
+        raise DataFetchError("Missing ALPHAVANTAGE_API_KEY")
+
+    spy_latest, spy_week = av_weekly_equity_close(session, av_key, "SPY")
+    prices["SPY"] = {"latest": spy_latest, "week_change_pct": spy_week}
+
+    silver_latest, silver_week = av_weekly_fx_close(session, av_key, "XAG", "USD")
+    prices["Silver (XAG/USD)"] = {"latest": silver_latest, "week_change_pct": silver_week}
+
+    return prices
 
 
-def fetch_news_your_api() -> list[dict]:
-    """
-    Replace the body of this function with your real news API logic.
+def fetch_news(session: requests.Session) -> list[dict[str, Any]]:
+    api_key = (env_str("NEWSAPI_API_KEY") or "").strip()
+    if not api_key:
+        raise DataFetchError("Missing NEWSAPI_API_KEY")
 
-    Expected output format example:
-    [
-      {"asset": "SPY", "title": "Headline", "source": "Publisher", "url": "https://..."},
-      {"asset": "Silver Eagle Coins", "title": "Headline", "source": "Publisher", "url": "https://..."}
+    out: list[dict[str, Any]] = []
+
+    # Hyper practical queries that tend to return relevant headlines
+    queries = [
+        ("SPY", "SPY OR S&P 500 ETF OR SPDR S&P 500"),
+        ("Silver (XAG/USD)", "silver price OR XAGUSD OR XAG/USD"),
     ]
-    """
-    return []
+
+    for asset, q in queries:
+        articles = newsapi_get(session, api_key, q, page_size=4)
+        for a in articles:
+            out.append(
+                {
+                    "asset": asset,
+                    "title": a.get("title", ""),
+                    "source": a.get("source", ""),
+                    "url": a.get("url", ""),
+                    "publishedAt": a.get("publishedAt", ""),
+                }
+            )
+
+    # Sort newest first if publishedAt is present
+    def sort_key(item: dict[str, Any]) -> str:
+        return str(item.get("publishedAt") or "")
+
+    out.sort(key=sort_key, reverse=True)
+    return out[:12]
 
 
 def main() -> int:
     errors: list[str] = []
-    prices: dict = {}
-    news: list[dict] = []
+    prices: dict[str, dict[str, Any]] = {}
+    news: list[dict[str, Any]] = []
+
+    session = make_session()
 
     try:
-        prices = fetch_prices_your_api()
+        prices = fetch_prices(session)
     except Exception:
-        errors.append("Pricing API failed.\n" + traceback.format_exc())
+        errors.append("Pricing failed.\n" + traceback.format_exc())
 
     try:
-        news = fetch_news_your_api()
+        news = fetch_news(session)
     except Exception:
-        errors.append("News API failed.\n" + traceback.format_exc())
+        errors.append("News failed.\n" + traceback.format_exc())
 
     try:
         subject, text_body, html_body = build_report(prices, news, errors)

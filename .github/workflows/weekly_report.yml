@@ -34,5 +34,8 @@ jobs:
           EMAIL_FROM_NAME: ${{ secrets.EMAIL_FROM_NAME }}
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          ALPHAVANTAGE_API_KEY: ${{ secrets.ALPHAVANTAGE_API_KEY }}
+          NEWSAPI_API_KEY: ${{ secrets.NEWSAPI_API_KEY }}
+
         run: |
           python weekly_report.py

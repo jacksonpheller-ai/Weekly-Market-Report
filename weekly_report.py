@@ -1,10 +1,9 @@
 # weekly_report.py
 # Weekly Market Recap email via Gmail SMTP
 # SPY weekly pricing from Alpha Vantage TIME_SERIES_WEEKLY_ADJUSTED
-# Silver XAG/USD spot from Alpha Vantage CURRENCY_EXCHANGE_RATE
-# Weekly change for silver computed versus last run using a cached state file
+# Silver proxy via SLV weekly pricing from Alpha Vantage TIME_SERIES_WEEKLY_ADJUSTED
 # Headlines from NewsAPI
-# Email always attempts send even if APIs fail
+# Always attempts email send even if APIs fail
 
 from __future__ import annotations
 
@@ -20,7 +19,6 @@ from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formataddr, make_msgid
-from pathlib import Path
 from typing import Any
 
 import smtplib
@@ -123,24 +121,6 @@ def badge_style(week_change_pct: Any) -> tuple[str, str]:
     if f < 0:
         return "badge down", "▼"
     return "badge neutral", ""
-
-
-# ========= State cache =========
-
-STATE_DIR = Path(".cache")
-STATE_PATH = STATE_DIR / "state.json"
-
-def load_state() -> dict[str, Any]:
-    try:
-        if not STATE_PATH.exists():
-            return {}
-        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-def save_state(state: dict[str, Any]) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    STATE_PATH.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 # ========= Email config and sender =========
@@ -247,7 +227,7 @@ def send_email(cfg: EmailConfig, subject: str, text_body: str, html_body: str | 
 
 def make_session() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "weekly-market-report/1.2", "Accept": "application/json"})
+    s.headers.update({"User-Agent": "weekly-market-report/1.3", "Accept": "application/json"})
     return s
 
 
@@ -314,11 +294,11 @@ def av_weekly_equity_close(session: requests.Session, api_key: str, symbol: str)
 
     ts = data.get("Weekly Adjusted Time Series")
     if not isinstance(ts, dict) or not ts:
-        raise DataFetchError("Alpha Vantage did not return weekly equity time series")
+        raise DataFetchError(f"Alpha Vantage did not return weekly equity time series for {symbol}")
 
     dates = sorted(ts.keys(), reverse=True)
     if len(dates) < 2:
-        raise DataFetchError("Not enough weekly equity points to compute weekly change")
+        raise DataFetchError(f"Not enough weekly points to compute weekly change for {symbol}")
 
     latest = ts[dates[0]]
     prev = ts[dates[1]]
@@ -330,23 +310,6 @@ def av_weekly_equity_close(session: requests.Session, api_key: str, symbol: str)
 
     week_change_pct = (latest_close / prev_close - 1.0) * 100.0
     return latest_close, week_change_pct
-
-
-def av_exchange_rate(session: requests.Session, api_key: str, from_currency: str, to_currency: str) -> float:
-    data = av_get_json(
-        session,
-        {"function": "CURRENCY_EXCHANGE_RATE", "from_currency": from_currency, "to_currency": to_currency, "apikey": api_key},
-    )
-    block = data.get("Realtime Currency Exchange Rate")
-    if not isinstance(block, dict):
-        raise DataFetchError("Alpha Vantage did not return exchange rate block")
-
-    rate_raw = block.get("5. Exchange Rate") or block.get("5. Exchange Rate")
-    rate = as_float(rate_raw)
-    if rate is None:
-        raise DataFetchError("Alpha Vantage exchange rate missing or not numeric")
-
-    return float(rate)
 
 
 # ========= NewsAPI =========
@@ -551,7 +514,7 @@ def build_report(prices: dict[str, dict[str, Any]], news: list[dict[str, Any]], 
   <div style="display:flex; gap:12px; flex-wrap:wrap; margin-bottom:16px;">
     <div style="flex:1; min-width:280px; background:#ffffff; border:1px solid #e8edf6; border-radius:16px; padding:14px;">
       <div style="font-size:12px; color:#64748b; letter-spacing:0.04em; text-transform:uppercase;">Coverage</div>
-      <div style="margin-top:6px; font-size:14px; color:#0f172a; font-weight:700;">SPY and Silver (XAG/USD)</div>
+      <div style="margin-top:6px; font-size:14px; color:#0f172a; font-weight:700;">SPY and Silver (SLV proxy)</div>
       <div style="margin-top:6px; font-size:12px; color:#475569;">Weekly change plus key headlines</div>
     </div>
     <div style="flex:1; min-width:280px; background:#ffffff; border:1px solid #e8edf6; border-radius:16px; padding:14px;">
@@ -589,36 +552,13 @@ def fetch_prices(session: requests.Session) -> dict[str, dict[str, Any]]:
     if not av_key:
         raise DataFetchError("Missing ALPHAVANTAGE_API_KEY")
 
-    state = load_state()
-
-    prices: dict[str, dict[str, Any]] = {
-        "SPY": {"latest": "NA", "week_change_pct": "NA"},
-        "Silver (XAG/USD)": {"latest": "NA", "week_change_pct": "NA"},
-    }
-
-    # SPY weekly from time series
     spy_latest, spy_week = av_weekly_equity_close(session, av_key, "SPY")
-    prices["SPY"] = {"latest": spy_latest, "week_change_pct": spy_week}
+    slv_latest, slv_week = av_weekly_equity_close(session, av_key, "SLV")
 
-    # Silver spot from exchange rate endpoint
-    silver_spot = av_exchange_rate(session, av_key, "XAG", "USD")
-
-    prev_silver = as_float(state.get("silver_spot_usd"))
-    silver_week = None
-    if prev_silver is not None and prev_silver != 0:
-        silver_week = (silver_spot / prev_silver - 1.0) * 100.0
-
-    prices["Silver (XAG/USD)"] = {
-        "latest": silver_spot,
-        "week_change_pct": silver_week if silver_week is not None else "NA",
+    return {
+        "SPY": {"latest": spy_latest, "week_change_pct": spy_week},
+        "Silver (SLV proxy)": {"latest": slv_latest, "week_change_pct": slv_week},
     }
-
-    # Persist for next run
-    state["silver_spot_usd"] = silver_spot
-    state["silver_spot_ts_utc"] = datetime.now(timezone.utc).isoformat()
-    save_state(state)
-
-    return prices
 
 
 def fetch_news(session: requests.Session) -> list[dict[str, Any]]:
@@ -629,7 +569,7 @@ def fetch_news(session: requests.Session) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     queries = [
         ("SPY", "SPY OR S&P 500 ETF OR SPDR S&P 500"),
-        ("Silver (XAG/USD)", "silver price OR XAGUSD OR XAG/USD"),
+        ("Silver (SLV proxy)", "SLV OR iShares Silver Trust OR silver price"),
     ]
 
     for asset, q in queries:

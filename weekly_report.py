@@ -1,8 +1,10 @@
 # weekly_report.py
-# Sharp HTML weekly market recap email using Gmail SMTP
-# SPY weekly pricing and Silver XAG/USD weekly pricing from Alpha Vantage
+# Weekly Market Recap email via Gmail SMTP
+# SPY weekly pricing from Alpha Vantage TIME_SERIES_WEEKLY_ADJUSTED
+# Silver XAG/USD spot from Alpha Vantage CURRENCY_EXCHANGE_RATE
+# Weekly change for silver computed versus last run using a cached state file
 # Headlines from NewsAPI
-# Always attempts email send even if APIs fail
+# Email always attempts send even if APIs fail
 
 from __future__ import annotations
 
@@ -18,6 +20,7 @@ from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formataddr, make_msgid
+from pathlib import Path
 from typing import Any
 
 import smtplib
@@ -120,6 +123,24 @@ def badge_style(week_change_pct: Any) -> tuple[str, str]:
     if f < 0:
         return "badge down", "▼"
     return "badge neutral", ""
+
+
+# ========= State cache =========
+
+STATE_DIR = Path(".cache")
+STATE_PATH = STATE_DIR / "state.json"
+
+def load_state() -> dict[str, Any]:
+    try:
+        if not STATE_PATH.exists():
+            return {}
+        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def save_state(state: dict[str, Any]) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_PATH.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 # ========= Email config and sender =========
@@ -226,7 +247,7 @@ def send_email(cfg: EmailConfig, subject: str, text_body: str, html_body: str | 
 
 def make_session() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "weekly-market-report/1.1", "Accept": "application/json"})
+    s.headers.update({"User-Agent": "weekly-market-report/1.2", "Accept": "application/json"})
     return s
 
 
@@ -250,10 +271,6 @@ def _av_throttle() -> None:
 
 
 def av_get_json(session: requests.Session, params: dict[str, Any]) -> dict[str, Any]:
-    """
-    Alpha Vantage sometimes returns a 200 with an 'Information' or 'Note' field when rate limited.
-    This function throttles and retries with backoff on those responses.
-    """
     last_err: Exception | None = None
 
     for attempt in range(1, len(AV_RATE_LIMIT_BACKOFF_SECONDS) + 2):
@@ -264,7 +281,6 @@ def av_get_json(session: requests.Session, params: dict[str, Any]) -> dict[str, 
             r.raise_for_status()
             data = r.json()
         except Exception as e:
-            last_err = e
             raise DataFetchError(f"Alpha Vantage request failed: {repr(e)}") from e
 
         if not isinstance(data, dict):
@@ -276,44 +292,18 @@ def av_get_json(session: requests.Session, params: dict[str, Any]) -> dict[str, 
         note = data.get("Note")
         info = data.get("Information")
 
-        # Rate limit signals
         if note or (info and "Thank you for using Alpha Vantage" in str(info)):
             last_err = RateLimitError(f"Alpha Vantage rate limit: {note or info}")
-
             if attempt <= len(AV_RATE_LIMIT_BACKOFF_SECONDS):
                 sleep_s = AV_RATE_LIMIT_BACKOFF_SECONDS[attempt - 1]
                 logging.warning(f"Alpha Vantage rate limited. Backing off for {sleep_s} seconds.")
                 time.sleep(sleep_s)
                 continue
-
             raise last_err
 
         return data
 
     raise DataFetchError(f"Alpha Vantage failed after retries. Last error: {repr(last_err)}")
-
-
-def av_weekly_fx_close(session: requests.Session, api_key: str, from_symbol: str, to_symbol: str) -> tuple[float, float]:
-    data = av_get_json(
-        session,
-        {"function": "FX_WEEKLY", "from_symbol": from_symbol, "to_symbol": to_symbol, "apikey": api_key},
-    )
-
-    ts = data.get("Time Series FX (Weekly)")
-    if not isinstance(ts, dict) or not ts:
-        raise DataFetchError("Alpha Vantage did not return weekly FX time series")
-
-    dates = sorted(ts.keys(), reverse=True)
-    if len(dates) < 2:
-        raise DataFetchError("Not enough weekly FX points to compute weekly change")
-
-    latest_close = float(ts[dates[0]]["4. close"])
-    prev_close = float(ts[dates[1]]["4. close"])
-    if prev_close == 0:
-        raise DataFetchError("Previous close was 0, cannot compute percent change")
-
-    week_change_pct = (latest_close / prev_close - 1.0) * 100.0
-    return latest_close, week_change_pct
 
 
 def av_weekly_equity_close(session: requests.Session, api_key: str, symbol: str) -> tuple[float, float]:
@@ -340,6 +330,23 @@ def av_weekly_equity_close(session: requests.Session, api_key: str, symbol: str)
 
     week_change_pct = (latest_close / prev_close - 1.0) * 100.0
     return latest_close, week_change_pct
+
+
+def av_exchange_rate(session: requests.Session, api_key: str, from_currency: str, to_currency: str) -> float:
+    data = av_get_json(
+        session,
+        {"function": "CURRENCY_EXCHANGE_RATE", "from_currency": from_currency, "to_currency": to_currency, "apikey": api_key},
+    )
+    block = data.get("Realtime Currency Exchange Rate")
+    if not isinstance(block, dict):
+        raise DataFetchError("Alpha Vantage did not return exchange rate block")
+
+    rate_raw = block.get("5. Exchange Rate") or block.get("5. Exchange Rate")
+    rate = as_float(rate_raw)
+    if rate is None:
+        raise DataFetchError("Alpha Vantage exchange rate missing or not numeric")
+
+    return float(rate)
 
 
 # ========= NewsAPI =========
@@ -582,24 +589,34 @@ def fetch_prices(session: requests.Session) -> dict[str, dict[str, Any]]:
     if not av_key:
         raise DataFetchError("Missing ALPHAVANTAGE_API_KEY")
 
+    state = load_state()
+
     prices: dict[str, dict[str, Any]] = {
         "SPY": {"latest": "NA", "week_change_pct": "NA"},
         "Silver (XAG/USD)": {"latest": "NA", "week_change_pct": "NA"},
     }
 
-    # Fetch SPY
-    try:
-        spy_latest, spy_week = av_weekly_equity_close(session, av_key, "SPY")
-        prices["SPY"] = {"latest": spy_latest, "week_change_pct": spy_week}
-    except Exception as e:
-        raise DataFetchError(f"SPY pricing failed: {repr(e)}") from e
+    # SPY weekly from time series
+    spy_latest, spy_week = av_weekly_equity_close(session, av_key, "SPY")
+    prices["SPY"] = {"latest": spy_latest, "week_change_pct": spy_week}
 
-    # Fetch Silver
-    try:
-        silver_latest, silver_week = av_weekly_fx_close(session, av_key, "XAG", "USD")
-        prices["Silver (XAG/USD)"] = {"latest": silver_latest, "week_change_pct": silver_week}
-    except Exception as e:
-        raise DataFetchError(f"Silver pricing failed: {repr(e)}") from e
+    # Silver spot from exchange rate endpoint
+    silver_spot = av_exchange_rate(session, av_key, "XAG", "USD")
+
+    prev_silver = as_float(state.get("silver_spot_usd"))
+    silver_week = None
+    if prev_silver is not None and prev_silver != 0:
+        silver_week = (silver_spot / prev_silver - 1.0) * 100.0
+
+    prices["Silver (XAG/USD)"] = {
+        "latest": silver_spot,
+        "week_change_pct": silver_week if silver_week is not None else "NA",
+    }
+
+    # Persist for next run
+    state["silver_spot_usd"] = silver_spot
+    state["silver_spot_ts_utc"] = datetime.now(timezone.utc).isoformat()
+    save_state(state)
 
     return prices
 

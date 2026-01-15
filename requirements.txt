@@ -1,2 +1,4 @@
 # email sending uses Python standard library only
 # add your API packages below if your pricing or news code requires them
+requests
+urllib3

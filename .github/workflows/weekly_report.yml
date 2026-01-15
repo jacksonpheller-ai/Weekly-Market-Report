@@ -1,14 +1,14 @@
 name: Weekly Market Report
 
 on:
-  schedule:
-    - cron: "15 22 * * 5"
   workflow_dispatch:
+  schedule:
+    # Fridays at 20:05 UTC (adjust if you want)
+    - cron: "5 20 * * 5"
 
 jobs:
-  run:
+  run-weekly-report:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
 
     steps:
       - name: Checkout
@@ -24,7 +24,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run script
+      - name: Restore state cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .cache
+          key: weekly-market-cache-${{ github.run_id }}
+          restore-keys: |
+            weekly-market-cache-
+
+      - name: Run weekly report
         env:
           GMAIL_USERNAME: ${{ secrets.GMAIL_USERNAME }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
@@ -36,6 +44,10 @@ jobs:
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           ALPHAVANTAGE_API_KEY: ${{ secrets.ALPHAVANTAGE_API_KEY }}
           NEWSAPI_API_KEY: ${{ secrets.NEWSAPI_API_KEY }}
+        run: python weekly_report.py
 
-        run: |
-          python weekly_report.py
+      - name: Save state cache
+        uses: actions/cache/save@v4
+        with:
+          path: .cache
+          key: weekly-market-cache-${{ github.run_id }}

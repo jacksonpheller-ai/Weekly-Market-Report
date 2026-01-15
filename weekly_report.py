@@ -227,7 +227,7 @@ def send_email(cfg: EmailConfig, subject: str, text_body: str, html_body: str | 
 
 def make_session() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "weekly-market-report/1.3", "Accept": "application/json"})
+    s.headers.update({"User-Agent": "weekly-market-report/1.4", "Accept": "application/json"})
     return s
 
 
@@ -447,7 +447,7 @@ def prices_table(prices: dict[str, dict[str, Any]]) -> str:
 
 def news_cards(news: list[dict[str, Any]]) -> str:
     items = []
-    for item in (news or [])[:12]:
+    for item in (news or [])[:10]:
         asset = escape_html(item.get("asset", ""))
         title = escape_html(item.get("title", ""))
         source = escape_html(item.get("source", ""))
@@ -517,11 +517,6 @@ def build_report(prices: dict[str, dict[str, Any]], news: list[dict[str, Any]], 
       <div style="margin-top:6px; font-size:14px; color:#0f172a; font-weight:700;">SPY and Silver (SLV proxy)</div>
       <div style="margin-top:6px; font-size:12px; color:#475569;">Weekly change plus key headlines</div>
     </div>
-    <div style="flex:1; min-width:280px; background:#ffffff; border:1px solid #e8edf6; border-radius:16px; padding:14px;">
-      <div style="font-size:12px; color:#64748b; letter-spacing:0.04em; text-transform:uppercase;">Reliability</div>
-      <div style="margin-top:6px; font-size:14px; color:#0f172a; font-weight:700;">Email always attempts send</div>
-      <div style="margin-top:6px; font-size:12px; color:#475569;">API errors are included below</div>
-    </div>
   </div>
 
   <div style="background:#ffffff; border:1px solid #e8edf6; border-radius:16px; padding:14px; margin-bottom:16px;">
@@ -567,13 +562,15 @@ def fetch_news(session: requests.Session) -> list[dict[str, Any]]:
         raise DataFetchError("Missing NEWSAPI_API_KEY")
 
     out: list[dict[str, Any]] = []
+
+    # Tight queries: require key terms, exclude noise, keep it asset-specific.
     queries = [
-        ("SPY", "SPY OR S&P 500 ETF OR SPDR S&P 500"),
-        ("Silver (SLV proxy)", "SLV OR iShares Silver Trust OR silver price"),
+        ("SPY", '("SPY" OR "SPDR S&P 500" OR "S&P 500 ETF") AND (ETF OR "S&P 500") -crypto -bitcoin -tesla'),
+        ("Silver (SLV proxy)", '("SLV" OR "iShares Silver Trust" OR "silver ETF") AND (silver OR bullion OR metals) -gold -bitcoin -crypto'),
     ]
 
     for asset, q in queries:
-        articles = newsapi_get(session, api_key, q, page_size=4)
+        articles = newsapi_get(session, api_key, q, page_size=3)
         for a in articles:
             out.append(
                 {
@@ -586,7 +583,7 @@ def fetch_news(session: requests.Session) -> list[dict[str, Any]]:
             )
 
     out.sort(key=lambda x: str(x.get("publishedAt") or ""), reverse=True)
-    return out[:12]
+    return out[:6]
 
 
 # ========= Main =========

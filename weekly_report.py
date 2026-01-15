@@ -2,7 +2,7 @@
 # Sharp HTML weekly market recap email using Gmail SMTP
 # SPY weekly pricing and Silver XAG/USD weekly pricing from Alpha Vantage
 # Headlines from NewsAPI
-# Designed to always attempt sending an email, even if APIs fail
+# Always attempts email send even if APIs fail
 
 from __future__ import annotations
 
@@ -22,11 +22,11 @@ from typing import Any
 
 import smtplib
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
+
+# ========= Exceptions =========
 
 class ConfigError(Exception):
     pass
@@ -39,6 +39,12 @@ class EmailSendError(Exception):
 class DataFetchError(Exception):
     pass
 
+
+class RateLimitError(DataFetchError):
+    pass
+
+
+# ========= Helpers =========
 
 def env_str(name: str, default: str | None = None, required: bool = False) -> str | None:
     val = os.getenv(name, default)
@@ -115,6 +121,8 @@ def badge_style(week_change_pct: Any) -> tuple[str, str]:
         return "badge down", "▼"
     return "badge neutral", ""
 
+
+# ========= Email config and sender =========
 
 @dataclass
 class EmailConfig:
@@ -214,49 +222,75 @@ def send_email(cfg: EmailConfig, subject: str, text_body: str, html_body: str | 
     raise EmailSendError(f"Failed to send after {max_retries} attempts. Last error: {repr(last_err)}")
 
 
+# ========= HTTP session =========
+
 def make_session() -> requests.Session:
     s = requests.Session()
-    retries = Retry(
-        total=5,
-        connect=5,
-        read=5,
-        status=5,
-        backoff_factor=0.8,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=("GET",),
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retries, pool_connections=10, pool_maxsize=10)
-    s.mount("https://", adapter)
-    s.mount("http://", adapter)
-    s.headers.update({"User-Agent": "weekly-market-report/1.0", "Accept": "application/json"})
+    s.headers.update({"User-Agent": "weekly-market-report/1.1", "Accept": "application/json"})
     return s
 
 
+# ========= Alpha Vantage with throttling =========
+
 ALPHAVANTAGE_BASE_URL = "https://www.alphavantage.co/query"
+
+AV_MIN_SECONDS_BETWEEN_CALLS = 1.2
+AV_RATE_LIMIT_BACKOFF_SECONDS = [15, 30, 60]
+
+_last_av_call_ts = 0.0
+
+
+def _av_throttle() -> None:
+    global _last_av_call_ts
+    now = time.time()
+    wait = AV_MIN_SECONDS_BETWEEN_CALLS - (now - _last_av_call_ts)
+    if wait > 0:
+        time.sleep(wait)
+    _last_av_call_ts = time.time()
 
 
 def av_get_json(session: requests.Session, params: dict[str, Any]) -> dict[str, Any]:
-    try:
-        r = session.get(ALPHAVANTAGE_BASE_URL, params=params, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-    except Exception as e:
-        raise DataFetchError(f"Alpha Vantage request failed: {repr(e)}") from e
+    """
+    Alpha Vantage sometimes returns a 200 with an 'Information' or 'Note' field when rate limited.
+    This function throttles and retries with backoff on those responses.
+    """
+    last_err: Exception | None = None
 
-    if not isinstance(data, dict):
-        raise DataFetchError("Alpha Vantage returned non JSON response")
+    for attempt in range(1, len(AV_RATE_LIMIT_BACKOFF_SECONDS) + 2):
+        _av_throttle()
 
-    if "Error Message" in data:
-        raise DataFetchError(f"Alpha Vantage error: {data.get('Error Message')}")
+        try:
+            r = session.get(ALPHAVANTAGE_BASE_URL, params=params, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+        except Exception as e:
+            last_err = e
+            raise DataFetchError(f"Alpha Vantage request failed: {repr(e)}") from e
 
-    if "Note" in data:
-        raise DataFetchError(f"Alpha Vantage rate limit: {data.get('Note')}")
+        if not isinstance(data, dict):
+            raise DataFetchError("Alpha Vantage returned non JSON response")
 
-    if "Information" in data and not any(k.startswith("Time Series") for k in data.keys()):
-        raise DataFetchError(f"Alpha Vantage info: {data.get('Information')}")
+        if "Error Message" in data:
+            raise DataFetchError(f"Alpha Vantage error: {data.get('Error Message')}")
 
-    return data
+        note = data.get("Note")
+        info = data.get("Information")
+
+        # Rate limit signals
+        if note or (info and "Thank you for using Alpha Vantage" in str(info)):
+            last_err = RateLimitError(f"Alpha Vantage rate limit: {note or info}")
+
+            if attempt <= len(AV_RATE_LIMIT_BACKOFF_SECONDS):
+                sleep_s = AV_RATE_LIMIT_BACKOFF_SECONDS[attempt - 1]
+                logging.warning(f"Alpha Vantage rate limited. Backing off for {sleep_s} seconds.")
+                time.sleep(sleep_s)
+                continue
+
+            raise last_err
+
+        return data
+
+    raise DataFetchError(f"Alpha Vantage failed after retries. Last error: {repr(last_err)}")
 
 
 def av_weekly_fx_close(session: requests.Session, api_key: str, from_symbol: str, to_symbol: str) -> tuple[float, float]:
@@ -308,6 +342,8 @@ def av_weekly_equity_close(session: requests.Session, api_key: str, symbol: str)
     return latest_close, week_change_pct
 
 
+# ========= NewsAPI =========
+
 NEWSAPI_BASE_URL = "https://newsapi.org/v2/everything"
 
 
@@ -350,6 +386,8 @@ def newsapi_get(session: requests.Session, api_key: str, query: str, page_size: 
         )
     return out
 
+
+# ========= Email rendering =========
 
 def html_wrapper(title: str, subtitle: str, body_html: str) -> str:
     return f"""
@@ -396,6 +434,7 @@ def prices_table(prices: dict[str, dict[str, Any]]) -> str:
         latest = v.get("latest")
         week_change_pct = v.get("week_change_pct")
         klass, arrow = badge_style(week_change_pct)
+
         rows.append(
             f"""
 <tr>
@@ -536,18 +575,33 @@ def build_report(prices: dict[str, dict[str, Any]], news: list[dict[str, Any]], 
     return subject, text_body, html_body
 
 
+# ========= Fetchers =========
+
 def fetch_prices(session: requests.Session) -> dict[str, dict[str, Any]]:
     av_key = (env_str("ALPHAVANTAGE_API_KEY") or "").strip()
     if not av_key:
         raise DataFetchError("Missing ALPHAVANTAGE_API_KEY")
 
-    spy_latest, spy_week = av_weekly_equity_close(session, av_key, "SPY")
-    silver_latest, silver_week = av_weekly_fx_close(session, av_key, "XAG", "USD")
-
-    return {
-        "SPY": {"latest": spy_latest, "week_change_pct": spy_week},
-        "Silver (XAG/USD)": {"latest": silver_latest, "week_change_pct": silver_week},
+    prices: dict[str, dict[str, Any]] = {
+        "SPY": {"latest": "NA", "week_change_pct": "NA"},
+        "Silver (XAG/USD)": {"latest": "NA", "week_change_pct": "NA"},
     }
+
+    # Fetch SPY
+    try:
+        spy_latest, spy_week = av_weekly_equity_close(session, av_key, "SPY")
+        prices["SPY"] = {"latest": spy_latest, "week_change_pct": spy_week}
+    except Exception as e:
+        raise DataFetchError(f"SPY pricing failed: {repr(e)}") from e
+
+    # Fetch Silver
+    try:
+        silver_latest, silver_week = av_weekly_fx_close(session, av_key, "XAG", "USD")
+        prices["Silver (XAG/USD)"] = {"latest": silver_latest, "week_change_pct": silver_week}
+    except Exception as e:
+        raise DataFetchError(f"Silver pricing failed: {repr(e)}") from e
+
+    return prices
 
 
 def fetch_news(session: requests.Session) -> list[dict[str, Any]]:
@@ -577,6 +631,8 @@ def fetch_news(session: requests.Session) -> list[dict[str, Any]]:
     out.sort(key=lambda x: str(x.get("publishedAt") or ""), reverse=True)
     return out[:12]
 
+
+# ========= Main =========
 
 def main() -> int:
     errors: list[str] = []
